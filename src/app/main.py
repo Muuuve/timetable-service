@@ -12,13 +12,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import health, testing
+from app.api import groups, health, lessons, testing
 from app.broker import UnconfiguredBrokerProbe
 from app.clock import AdjustableClock
 from app.context import AppContext
-from app.db import make_engine, make_session_factory
+from app.db import make_engine, make_session_factory, session_scope
 from app.errors import install_error_handlers
 from app.jobs import JobRegistry, run_periodically
+from app.seed import reset_database
 from app.settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,12 @@ def build_context(settings: Settings) -> AppContext:
     )
     # ---> точка расширения: регистрация фоновых задач, например
     # context.jobs.register("<job-name>", <корутина, возвращающая int>)
-    # ---> точка расширения: context.reset_state = <очистка таблиц + загрузка seed>
+
+    async def reset_state() -> None:
+        async with session_scope(context.session_factory) as session:
+            await reset_database(session)
+
+    context.reset_state = reset_state
     return context
 
 
@@ -80,6 +86,8 @@ def create_app() -> FastAPI:
     install_error_handlers(app)
     app.include_router(health.router)
     app.include_router(testing.router)
+    app.include_router(groups.router)
+    app.include_router(lessons.router)
     # ---> точка расширения: app.include_router(<предметный роутер>)
     return app
 

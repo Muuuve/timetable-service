@@ -10,12 +10,17 @@ import asyncio
 import json
 import logging
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import delete
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import make_engine, make_session_factory
+from app.models import Group, Lesson, LessonFormat, LessonStatus
 from app.settings import get_settings
 
 # Корень репозитория: src/app/seed.py → parents[2]. В образе это /app (editable-установка пакета).
@@ -53,11 +58,63 @@ def read_all(seed_dir: Path = SEED_DIR) -> dict[str, SeedRecords]:
 async def load_seed(session: AsyncSession, data: dict[str, SeedRecords]) -> None:
     """Записать seed в БД поверх пустых таблиц.
 
-    Реализуется автором сервиса после появления моделей. Договорённости: прямые INSERT без доменной
-    валидации, фиксированные UUID из файлов, идемпотентность.
+    Прямые INSERT без доменной валидации и без people-stub. Повторный запуск на тех же
+    UUID не падает и не плодит строки (``ON CONFLICT DO NOTHING``). Сначала группы,
+    потом занятия — у L7 есть ``rescheduled_from_id`` на L6.
     """
-    msg = "Загрузчик seed не реализован: см. src/app/seed.py и TASK.md, §3.5"
-    raise NotImplementedError(msg)
+    groups = data.get("groups", [])
+    if groups:
+        group_rows = [
+            {
+                "id": uuid.UUID(row["id"]),
+                "name": row["name"],
+                "size": row["size"],
+            }
+            for row in groups
+        ]
+        await session.execute(
+            insert(Group).values(group_rows).on_conflict_do_nothing(index_elements=["id"])
+        )
+
+    lessons = data.get("lessons", [])
+    if lessons:
+        lesson_rows = [
+            {
+                "id": uuid.UUID(row["id"]),
+                "group_id": uuid.UUID(row["group_id"]),
+                "instructor_id": uuid.UUID(row["instructor_id"]),
+                "classroom_id": (
+                    uuid.UUID(row["classroom_id"]) if row.get("classroom_id") else None
+                ),
+                "format": LessonFormat(row["format"]),
+                "status": LessonStatus(row["status"]),
+                "starts_at": datetime.fromisoformat(row["starts_at"].replace("Z", "+00:00")),
+                "ends_at": datetime.fromisoformat(row["ends_at"].replace("Z", "+00:00")),
+                "rescheduled_from_id": (
+                    uuid.UUID(row["rescheduled_from_id"])
+                    if row.get("rescheduled_from_id")
+                    else None
+                ),
+                "cancel_reason": row.get("cancel_reason"),
+                "created_at": datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")),
+                "updated_at": datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00")),
+            }
+            for row in lessons
+        ]
+        await session.execute(
+            insert(Lesson).values(lesson_rows).on_conflict_do_nothing(index_elements=["id"])
+        )
+
+
+async def reset_database(session: AsyncSession) -> None:
+    """Очистить таблицы занятий и групп и заново загрузить seed.
+
+    Порядок удаления: сначала ``lessons`` (FK на группу и на себя), потом ``groups``.
+    Часы сервиса не затрагиваются — ими управляет только ``/__test/time``.
+    """
+    await session.execute(delete(Lesson))
+    await session.execute(delete(Group))
+    await load_seed(session, read_all())
 
 
 async def main() -> int:
