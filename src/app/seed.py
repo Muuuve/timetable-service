@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import delete
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -103,6 +104,17 @@ async def load_seed(session: AsyncSession, data: dict[str, SeedRecords]) -> None
         await session.execute(
             insert(Lesson).values(lesson_rows).on_conflict_do_nothing(index_elements=["id"])
         )
+
+
+async def reset_database(session: AsyncSession) -> None:
+    """Очистить таблицы занятий и групп и заново загрузить seed.
+
+    Порядок удаления: сначала ``lessons`` (FK на группу и на себя), потом ``groups``.
+    Часы сервиса не затрагиваются — ими управляет только ``/__test/time``.
+    """
+    await session.execute(delete(Lesson))
+    await session.execute(delete(Group))
+    await load_seed(session, read_all())
 
 
 async def main() -> int:
