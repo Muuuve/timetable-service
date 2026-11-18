@@ -12,12 +12,9 @@ from alembic import context
 from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from app import models  # noqa: F401
 from app.db import Base
 from app.settings import get_settings
-
-# ---> точка расширения: импортируйте модули с ORM-классами, чтобы они зарегистрировались
-# в Base.metadata, например: from app import models
-from app import models
 
 config = context.config
 if config.config_file_name is not None:
