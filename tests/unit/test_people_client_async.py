@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 from uuid import UUID
 
 import httpx
@@ -21,18 +22,21 @@ LATENCY_S = 0.3
 INSTRUCTOR_ID = UUID("1b000000-0000-4000-8000-000000000001")
 CLASSROOM_ID = UUID("2c000000-0000-4000-8000-000000000001")
 
-_INSTRUCTOR_JSON = {
+JsonDict = dict[str, Any]
+RouteMap = dict[str, tuple[int, JsonDict]]
+
+_INSTRUCTOR_JSON: JsonDict = {
     "id": str(INSTRUCTOR_ID),
     "full_name": "Анна Королёва",
     "max_hours_per_day": 6,
     "timezone": "Asia/Yekaterinburg",
 }
-_AVAILABILITY_JSON = {
+_AVAILABILITY_JSON: JsonDict = {
     "instructor_id": str(INSTRUCTOR_ID),
     "timezone": "Asia/Yekaterinburg",
     "windows": [{"weekday": 1, "from": "09:00", "to": "18:00"}],
 }
-_CLASSROOM_JSON = {
+_CLASSROOM_JSON: JsonDict = {
     "id": str(CLASSROOM_ID),
     "name": "Ауд. 101",
     "capacity": 30,
@@ -43,7 +47,7 @@ _CLASSROOM_JSON = {
 class _DelayedTransport(httpx.AsyncBaseTransport):
     """Транспорт: искусственная задержка и счётчик одновременных запросов."""
 
-    def __init__(self, latency_s: float, routes: dict[str, tuple[int, dict[str, object]]]) -> None:
+    def __init__(self, latency_s: float, routes: RouteMap) -> None:
         self.latency_s = latency_s
         self.routes = routes
         self.in_flight = 0
@@ -60,7 +64,7 @@ class _DelayedTransport(httpx.AsyncBaseTransport):
             self.in_flight -= 1
 
 
-def _ok_routes() -> dict[str, tuple[int, dict[str, object]]]:
+def _ok_routes() -> RouteMap:
     return {
         f"/instructors/{INSTRUCTOR_ID}": (200, _INSTRUCTOR_JSON),
         f"/instructors/{INSTRUCTOR_ID}/availability": (200, _AVAILABILITY_JSON),
