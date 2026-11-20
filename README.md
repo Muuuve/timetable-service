@@ -58,5 +58,6 @@ just test tests/unit/test_people_client_async.py -q
 | WP-00 Процесс | 0,75 | 1,5 | 2,0 | |
 | wp01-load-seed-data | 0,8 | 2,0 | 3,5 | Отладка windows: python3, git. Изменение CRLF в entrypoint |
 | wp02-add-people-client | 0,75 | 1,5 | 2,0 | |
-| wp03-detect-lesson-conflicts | 1,75 | 3,0 | | |
+| wp03-detect-lesson-conflicts | 1,75 | 3,0 | 3,5 | |
+| wp04-list-and-edit-lessons | 0,8 | 1,5 | | |
 | Итого | | | | |
