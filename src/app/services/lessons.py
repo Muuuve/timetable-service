@@ -1,6 +1,6 @@
-"""Операции с занятиями: create/validate (FR-01/02), список (FR-03).
+"""Операции с занятиями: create/validate (FR-01/02), список (FR-03), PATCH (FR-05).
 
-Create/validate: группа → local BR-01…03 → PeopleClient → existing → домен → INSERT.
+Create/validate/update: группа → local BR-01…03 → PeopleClient → existing → домен.
 Список: фильтры в SQL, сортировка и пагинация без stub.
 """
 
@@ -34,7 +34,7 @@ _VALIDATE_AS_VIOLATION = frozenset({"CLASSROOM_TOO_SMALL", "SCHEDULE_CONFLICT"})
 
 @dataclass(frozen=True, slots=True)
 class LessonInput:
-    """Вход create/validate (тело LessonCreate без HTTP)."""
+    """Вход create/validate/update (поля занятия без HTTP)."""
 
     group_id: UUID
     instructor_id: UUID
@@ -42,6 +42,7 @@ class LessonInput:
     format: LessonFormat
     starts_at: datetime
     ends_at: datetime
+    exclude_lesson_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +163,51 @@ async def create_lesson(
     return CreateResult(lesson=lesson, warnings=outcome.warnings)
 
 
+async def update_lesson(
+    session: AsyncSession,
+    people: PeopleClient,
+    clock: Clock,
+    lesson_id: UUID,
+    patch: dict[str, Any],
+) -> CreateResult:
+    """Частично изменить занятие в PLANNED (FR-05).
+
+    ``patch`` — только переданные поля (exclude_unset). Hard → ApiError без UPDATE.
+    """
+    lesson = await session.get(Lesson, lesson_id)
+    if lesson is None:
+        raise ApiError(404, "NOT_FOUND", "Занятие не найдено", {})
+    if lesson.status is not LessonStatus.PLANNED:
+        raise ApiError(
+            409,
+            "LESSON_NOT_EDITABLE",
+            "Изменять можно только занятие в статусе PLANNED",
+            {"current_status": lesson.status.value},
+        )
+
+    data = LessonInput(
+        group_id=lesson.group_id,
+        instructor_id=patch.get("instructor_id", lesson.instructor_id),
+        classroom_id=patch.get("classroom_id", lesson.classroom_id),
+        format=patch.get("format", lesson.format),
+        starts_at=patch.get("starts_at", lesson.starts_at),
+        ends_at=patch.get("ends_at", lesson.ends_at),
+        exclude_lesson_id=lesson.id,
+    )
+    outcome = await _evaluate(session, people, data)
+    if outcome.hard is not None:
+        raise _hard_to_api_error(outcome.hard)
+
+    lesson.instructor_id = data.instructor_id
+    lesson.classroom_id = data.classroom_id
+    lesson.format = data.format
+    lesson.starts_at = data.starts_at
+    lesson.ends_at = data.ends_at
+    lesson.updated_at = clock.now()
+    await session.flush()
+    return CreateResult(lesson=lesson, warnings=outcome.warnings)
+
+
 async def _evaluate(
     session: AsyncSession,
     people: PeopleClient,
@@ -175,6 +221,7 @@ async def _evaluate(
         format=data.format,
         starts_at=data.starts_at,
         ends_at=data.ends_at,
+        exclude_lesson_id=data.exclude_lesson_id,
     )
 
     group_size = await _load_group_size(session, data.group_id)

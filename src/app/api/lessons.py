@@ -1,12 +1,19 @@
-"""HTTP-слой занятий: создание, validate, список и чтение (FR-01…FR-04)."""
+"""HTTP-слой занятий: create/validate/list/get/patch (FR-01…FR-05)."""
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Query, Request
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_serializer
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    model_validator,
+)
 
 from app.clients.people import PeopleClient
 from app.clock import to_iso_z
@@ -19,6 +26,7 @@ from app.services.lessons import (
     LessonInput,
     create_lesson,
     list_lessons,
+    update_lesson,
     validate_lesson,
 )
 
@@ -36,6 +44,25 @@ class LessonCreateBody(BaseModel):
     format: LessonFormat
     starts_at: AwareDatetime
     ends_at: AwareDatetime
+
+
+class LessonPatchBody(BaseModel):
+    """Тело ``PATCH /lessons/{id}`` (openapi ``LessonPatch``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    instructor_id: UUID | None = None
+    classroom_id: UUID | None = None
+    format: LessonFormat | None = None
+    starts_at: AwareDatetime | None = None
+    ends_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> Self:
+        if not self.model_fields_set:
+            msg = "Нужно передать хотя бы одно поле"
+            raise ValueError(msg)
+        return self
 
 
 class LessonResponse(BaseModel):
@@ -182,3 +209,20 @@ async def get_lesson(lesson_id: UUID, request: Request) -> LessonResponse:
     if lesson is None:
         raise not_found("Занятие не найдено")
     return LessonResponse.model_validate(lesson)
+
+
+@router.patch("/{lesson_id}", response_model=LessonWithWarningsResponse)
+async def patch_lesson(
+    lesson_id: UUID, body: LessonPatchBody, request: Request
+) -> LessonWithWarningsResponse:
+    """Изменить занятие в статусе PLANNED (FR-05)."""
+    context = get_context(request)
+    patch = body.model_dump(exclude_unset=True)
+    async with httpx.AsyncClient(base_url=context.settings.stub_base_url) as http:
+        people = PeopleClient(http, context.settings.stub_timeout_ms)
+        async with session_scope(context.session_factory) as session:
+            result = await update_lesson(session, people, context.clock, lesson_id, patch)
+    return LessonWithWarningsResponse(
+        lesson=LessonResponse.model_validate(result.lesson),
+        warnings=[_to_warning(item) for item in result.warnings],
+    )
