@@ -1,7 +1,7 @@
-"""Создание и валидация занятия (FR-01, FR-02).
+"""Операции с занятиями: create/validate (FR-01/02), список (FR-03).
 
-Оркестрация: группа из БД → local BR-01…03 → PeopleClient → existing → домен → INSERT.
-HTTP-роуты сюда не входят (пункт 3 tasks.md).
+Create/validate: группа → local BR-01…03 → PeopleClient → existing → домен → INSERT.
+Список: фильтры в SQL, сортировка и пагинация без stub.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.people import PeopleClient
@@ -59,6 +59,56 @@ class CreateResult:
 
     lesson: Lesson
     warnings: tuple[WarningItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LessonPage:
+    """Страница списка занятий (openapi LessonPage)."""
+
+    items: tuple[Lesson, ...]
+    total: int
+
+
+async def list_lessons(
+    session: AsyncSession,
+    *,
+    group_id: UUID | None = None,
+    instructor_id: UUID | None = None,
+    classroom_id: UUID | None = None,
+    status: LessonStatus | None = None,
+    starts_from: datetime | None = None,
+    starts_to: datetime | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> LessonPage:
+    """Список с фильтрами (И), сортировкой и пагинацией (FR-03)."""
+    filters: list[Any] = []
+    if group_id is not None:
+        filters.append(Lesson.group_id == group_id)
+    if instructor_id is not None:
+        filters.append(Lesson.instructor_id == instructor_id)
+    if classroom_id is not None:
+        filters.append(Lesson.classroom_id == classroom_id)
+    if status is not None:
+        filters.append(Lesson.status == status)
+    if starts_from is not None:
+        filters.append(Lesson.starts_at >= starts_from)
+    if starts_to is not None:
+        filters.append(Lesson.starts_at < starts_to)
+
+    count_stmt = select(func.count()).select_from(Lesson)
+    list_stmt = select(Lesson)
+    if filters:
+        count_stmt = count_stmt.where(*filters)
+        list_stmt = list_stmt.where(*filters)
+
+    total = int(await session.scalar(count_stmt) or 0)
+    rows = (
+        await session.scalars(
+            list_stmt.order_by(Lesson.starts_at.asc(), Lesson.id.asc()).offset(offset).limit(limit)
+        )
+    ).all()
+    return LessonPage(items=tuple(rows), total=total)
 
 
 async def validate_lesson(

@@ -1,11 +1,11 @@
-"""HTTP-слой занятий: создание, validate и чтение (FR-01, FR-02, FR-04)."""
+"""HTTP-слой занятий: создание, validate, список и чтение (FR-01…FR-04)."""
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_serializer
 
 from app.clients.people import PeopleClient
@@ -18,6 +18,7 @@ from app.models import Lesson, LessonFormat, LessonStatus
 from app.services.lessons import (
     LessonInput,
     create_lesson,
+    list_lessons,
     validate_lesson,
 )
 
@@ -83,6 +84,13 @@ class ValidationResultResponse(BaseModel):
     warnings: list[WarningResponse]
 
 
+class LessonPageResponse(BaseModel):
+    """Ответ ``GET /lessons`` (openapi ``LessonPage``)."""
+
+    items: list[LessonResponse]
+    total: int
+
+
 def _to_warning(item: WarningItem) -> WarningResponse:
     return WarningResponse(code=item.code, message=item.message, details=dict(item.details))
 
@@ -130,6 +138,38 @@ async def post_validate_lesson(
         ok=result.ok,
         violations=list(result.violations),
         warnings=[_to_warning(item) for item in result.warnings],
+    )
+
+
+@router.get("", response_model=LessonPageResponse)
+async def get_lessons(
+    request: Request,
+    group_id: UUID | None = None,
+    instructor_id: UUID | None = None,
+    classroom_id: UUID | None = None,
+    status: LessonStatus | None = None,
+    starts_from: Annotated[AwareDatetime | None, Query(alias="from")] = None,
+    starts_to: Annotated[AwareDatetime | None, Query(alias="to")] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> LessonPageResponse:
+    """Список занятий с фильтрами (FR-03)."""
+    context = get_context(request)
+    async with context.session_factory() as session:
+        page = await list_lessons(
+            session,
+            group_id=group_id,
+            instructor_id=instructor_id,
+            classroom_id=classroom_id,
+            status=status,
+            starts_from=starts_from,
+            starts_to=starts_to,
+            limit=limit,
+            offset=offset,
+        )
+    return LessonPageResponse(
+        items=[LessonResponse.model_validate(item) for item in page.items],
+        total=page.total,
     )
 
 
