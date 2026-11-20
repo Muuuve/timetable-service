@@ -98,6 +98,17 @@ def overlap_bounds(
     return max(a_start, b_start), min(a_end, b_end)
 
 
+def local_hard_failure(candidate: LessonCandidate, group_size: int | None) -> HardFailure | None:
+    """BR-01…BR-03 без stub и БД-занятий — чтобы не звать people при раннем отказе."""
+    hard = _br01_duration(candidate)
+    if hard is not None:
+        return hard
+    hard = _br02_classroom_format(candidate)
+    if hard is not None:
+        return hard
+    return _br03_group_exists(group_size)
+
+
 def evaluate_lesson_rules(
     candidate: LessonCandidate,
     *,
@@ -110,15 +121,7 @@ def evaluate_lesson_rules(
     ``people`` нужен с BR-04 (после успешного fetch stub). Вызывающий обязан сначала
     отловить 404/5xx/таймаут клиента как ``ApiError``.
     """
-    hard = _br01_duration(candidate)
-    if hard is not None:
-        return RuleOutcome(hard=hard)
-
-    hard = _br02_classroom_format(candidate)
-    if hard is not None:
-        return RuleOutcome(hard=hard)
-
-    hard = _br03_group_exists(group_size)
+    hard = local_hard_failure(candidate, group_size)
     if hard is not None:
         return RuleOutcome(hard=hard)
 
