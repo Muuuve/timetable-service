@@ -60,5 +60,6 @@ just test tests/unit/test_people_client_async.py -q
 | wp02-add-people-client | 0,75 | 1,5 | 2,0 | |
 | wp03-detect-lesson-conflicts | 1,75 | 3,0 | 3,5 | |
 | wp04-list-and-edit-lessons | 0,8 | 1,5 | 1,5 | |
-| wp05-manage-lesson-lifecycle | 1,5 | 2,0 | | |
+| wp05-manage-lesson-lifecycle | 1,5 | 2,0 | 2,0 | |
+| wp06-publish-lesson-events | 0,7 | 1,0 | | |
 | Итого | | | | |
