@@ -90,7 +90,40 @@ async def test_rabbit_publish_requires_connect() -> None:
 async def test_rabbit_ping_false_until_connected() -> None:
     broker = RabbitMqEventBroker("amqp://test")
     assert await broker.ping() is False
+
+
+@pytest.mark.asyncio
+async def test_rabbit_ping_true_when_passive_declare_ok() -> None:
+    broker = RabbitMqEventBroker("amqp://test")
+    channel = AsyncMock()
+    channel.declare_exchange = AsyncMock()
+    channel.close = AsyncMock()
     connection = MagicMock()
     connection.is_closed = False
+    connection.channel = AsyncMock(return_value=channel)
     broker._connection = connection
+
     assert await broker.ping() is True
+    channel.declare_exchange.assert_awaited_once()
+    channel.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rabbit_ping_false_when_broker_unreachable() -> None:
+    broker = RabbitMqEventBroker("amqp://test")
+    connection = MagicMock()
+    connection.is_closed = False
+    connection.channel = AsyncMock(side_effect=ConnectionError("down"))
+    broker._connection = connection
+
+    assert await broker.ping() is False
+
+
+@pytest.mark.asyncio
+async def test_rabbit_ping_false_when_connection_closed() -> None:
+    broker = RabbitMqEventBroker("amqp://test")
+    connection = MagicMock()
+    connection.is_closed = True
+    broker._connection = connection
+
+    assert await broker.ping() is False
