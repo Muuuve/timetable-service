@@ -1557,6 +1557,7 @@ version = "0.1.0"
 source = { editable = "." }
 default-groups = ["dev", "e2e"]
 dependencies = [
+    { name = "aio-pika" },
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "fastapi" },
@@ -1589,6 +1590,7 @@ e2e = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aio-pika", specifier = ">=9.4" },
     { name = "alembic", specifier = ">=1.13" },
     { name = "asyncpg", specifier = ">=0.29" },
     { name = "fastapi", specifier = ">=0.115" },
