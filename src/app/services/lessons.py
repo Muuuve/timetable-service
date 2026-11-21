@@ -1,5 +1,5 @@
 """Операции с занятиями: create/validate (FR-01/02), список (FR-03), PATCH (FR-05),
-confirm/cancel/complete/reschedule (FR-06…FR-09).
+confirm/cancel/complete/reschedule (FR-06…FR-09), sweeper (FR-10).
 
 Create/validate/update/reschedule: группа → local BR-01…03 → PeopleClient → existing → домен.
 Список: фильтры в SQL, сортировка и пагинация без stub.
@@ -34,6 +34,8 @@ from app.models import Group, Lesson, LessonFormat, LessonStatus
 
 # Коды hard, которые validate отдаёт в violations (200), а не как HTTP-ошибку.
 _VALIDATE_AS_VIOLATION = frozenset({"CLASSROOM_TOO_SMALL", "SCHEDULE_CONFLICT"})
+
+LESSON_STATUS_SWEEPER = "lesson-status-sweeper"
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +303,25 @@ async def complete_lesson(
     lesson.updated_at = now
     await session.flush()
     return TransitionResult(lesson=lesson, event=None)
+
+
+async def sweep_confirmed_lessons(session: AsyncSession, clock: Clock) -> int:
+    """CONFIRMED с ``starts_at ≤ now`` → IN_PROGRESS (FR-10). Возвращает число обновлённых."""
+    now = clock.now()
+    rows = (
+        await session.scalars(
+            select(Lesson).where(
+                Lesson.status == LessonStatus.CONFIRMED,
+                Lesson.starts_at <= now,
+            )
+        )
+    ).all()
+    for lesson in rows:
+        lesson.status = LessonStatus.IN_PROGRESS
+        lesson.updated_at = now
+    if rows:
+        await session.flush()
+    return len(rows)
 
 
 async def reschedule_lesson(

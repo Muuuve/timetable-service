@@ -26,6 +26,7 @@ from app.db import make_engine, make_session_factory, session_scope
 from app.errors import install_error_handlers
 from app.jobs import JobRegistry, run_periodically
 from app.seed import reset_database
+from app.services.lessons import LESSON_STATUS_SWEEPER, sweep_confirmed_lessons
 from app.settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
@@ -53,8 +54,12 @@ def build_context(settings: Settings) -> AppContext:
         event_publisher=event_publisher,
         jobs=JobRegistry(),
     )
-    # ---> точка расширения: регистрация фоновых задач, например
-    # context.jobs.register("<job-name>", <корутина, возвращающая int>)
+
+    async def run_lesson_status_sweeper() -> int:
+        async with session_scope(context.session_factory) as session:
+            return await sweep_confirmed_lessons(session, context.clock)
+
+    context.jobs.register(LESSON_STATUS_SWEEPER, run_lesson_status_sweeper)
 
     async def reset_state() -> None:
         async with session_scope(context.session_factory) as session:
