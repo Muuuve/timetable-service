@@ -101,8 +101,23 @@ class RabbitMqEventBroker:
         log.info("RabbitMQ connected: exchange=%s", EXCHANGE_NAME)
 
     async def ping(self) -> bool:
-        """True, если соединение открыто."""
-        return self._connection is not None and not self._connection.is_closed
+        """True, если брокер отвечает (passive declare exchange), не только локальный флаг."""
+        if self._connection is None or self._connection.is_closed:
+            return False
+        try:
+            channel = await self._connection.channel()
+            try:
+                await channel.declare_exchange(
+                    EXCHANGE_NAME,
+                    aio_pika.ExchangeType.TOPIC,
+                    durable=True,
+                    passive=True,
+                )
+            finally:
+                await channel.close()
+        except Exception:
+            return False
+        return True
 
     async def publish(self, event: dict[str, Any]) -> None:
         """Опубликовать конверт: JSON, ``message_id=event_id``, persistent."""
