@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.broker import BrokerProbe
+from app.broker import BrokerProbe, EventPublisher, NullEventPublisher
 from app.clock import AdjustableClock
 from app.jobs import JobRegistry
 from app.settings import Settings
@@ -21,6 +21,7 @@ class AppContext:
     session_factory: async_sessionmaker[AsyncSession]
     clock: AdjustableClock
     broker_probe: BrokerProbe
+    event_publisher: EventPublisher = field(default_factory=NullEventPublisher)
     jobs: JobRegistry = field(default_factory=JobRegistry)
     # POST /__test/reset: очистка данных и повторный seed. В каркасе не задан (ответ 501),
     # реализация появляется вместе с моделями и загрузчиком seed (src/app/seed.py).
