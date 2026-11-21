@@ -1,4 +1,6 @@
-"""HTTP-слой занятий: create/validate/list/get/patch (FR-01…FR-05)."""
+"""HTTP-слой занятий: create/validate/list/get/patch (FR-01…FR-05),
+confirm/cancel/complete (FR-06/07/09).
+"""
 
 from datetime import datetime
 from typing import Annotated, Any, Self
@@ -24,6 +26,9 @@ from app.errors import not_found
 from app.models import Lesson, LessonFormat, LessonStatus
 from app.services.lessons import (
     LessonInput,
+    cancel_lesson,
+    complete_lesson,
+    confirm_lesson,
     create_lesson,
     list_lessons,
     update_lesson,
@@ -63,6 +68,14 @@ class LessonPatchBody(BaseModel):
             msg = "Нужно передать хотя бы одно поле"
             raise ValueError(msg)
         return self
+
+
+class CancelBody(BaseModel):
+    """Тело ``POST /lessons/{id}/cancel`` (openapi ``CancelRequest``); необязательно."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str | None, Field(default=None, max_length=500)] = None
 
 
 class LessonResponse(BaseModel):
@@ -226,3 +239,39 @@ async def patch_lesson(
         lesson=LessonResponse.model_validate(result.lesson),
         warnings=[_to_warning(item) for item in result.warnings],
     )
+
+
+@router.post("/{lesson_id}/confirm", response_model=LessonResponse)
+async def post_confirm_lesson(lesson_id: UUID, request: Request) -> LessonResponse:
+    """Подтвердить занятие PLANNED → CONFIRMED (FR-06)."""
+    context = get_context(request)
+    async with session_scope(context.session_factory) as session:
+        result = await confirm_lesson(session, context.clock, lesson_id)
+    if result.event is not None:
+        await context.event_publisher.publish(result.event)
+    return LessonResponse.model_validate(result.lesson)
+
+
+@router.post("/{lesson_id}/cancel", response_model=LessonResponse)
+async def post_cancel_lesson(
+    lesson_id: UUID,
+    request: Request,
+    body: CancelBody | None = None,
+) -> LessonResponse:
+    """Отменить занятие PLANNED|CONFIRMED → CANCELLED (FR-07)."""
+    context = get_context(request)
+    reason = body.reason if body is not None else None
+    async with session_scope(context.session_factory) as session:
+        result = await cancel_lesson(session, context.clock, lesson_id, reason=reason)
+    if result.event is not None:
+        await context.event_publisher.publish(result.event)
+    return LessonResponse.model_validate(result.lesson)
+
+
+@router.post("/{lesson_id}/complete", response_model=LessonResponse)
+async def post_complete_lesson(lesson_id: UUID, request: Request) -> LessonResponse:
+    """Завершить занятие IN_PROGRESS → COMPLETED (FR-09, BR-08)."""
+    context = get_context(request)
+    async with session_scope(context.session_factory) as session:
+        result = await complete_lesson(session, context.clock, lesson_id)
+    return LessonResponse.model_validate(result.lesson)
