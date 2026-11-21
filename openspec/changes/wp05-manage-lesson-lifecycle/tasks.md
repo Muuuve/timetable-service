@@ -4,4 +4,4 @@
 - [x] `confirm` / `cancel` / `complete` (переходы, BR-08, ответы по openapi)
 - [x] Атомарный `reschedule` + BR для нового занятия
 - [x] Задача `lesson-status-sweeper` и регистрация в jobs
-- [ ] Тесты и `just e2e-public` (E2E-17); `just check`, merge
+- [x] Тесты и `just e2e-public` (E2E-17); `just check`, merge
