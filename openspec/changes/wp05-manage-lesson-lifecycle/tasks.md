@@ -3,5 +3,5 @@
 - [x] Публикация событий в брокер (конверт, RabbitMQ по `BROKER`)
 - [x] `confirm` / `cancel` / `complete` (переходы, BR-08, ответы по openapi)
 - [x] Атомарный `reschedule` + BR для нового занятия
-- [ ] Задача `lesson-status-sweeper` и регистрация в jobs
+- [x] Задача `lesson-status-sweeper` и регистрация в jobs
 - [ ] Тесты и `just e2e-public` (E2E-17); `just check`, merge
