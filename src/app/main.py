@@ -13,13 +13,20 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api import groups, health, lessons, testing
-from app.broker import UnconfiguredBrokerProbe
+from app.broker import (
+    BrokerProbe,
+    EventPublisher,
+    NullEventPublisher,
+    RabbitMqEventBroker,
+    UnconfiguredBrokerProbe,
+)
 from app.clock import AdjustableClock
 from app.context import AppContext
 from app.db import make_engine, make_session_factory, session_scope
 from app.errors import install_error_handlers
 from app.jobs import JobRegistry, run_periodically
 from app.seed import reset_database
+from app.services.lessons import LESSON_STATUS_SWEEPER, sweep_confirmed_lessons
 from app.settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
@@ -28,17 +35,31 @@ log = logging.getLogger(__name__)
 def build_context(settings: Settings) -> AppContext:
     """Создать зависимости процесса (вне lifespan, чтобы тесты собирали контекст без сети)."""
     engine = make_engine(settings.database_url)
+    broker_probe: BrokerProbe
+    event_publisher: EventPublisher
+    if settings.broker == "rabbitmq":
+        rabbit = RabbitMqEventBroker(settings.broker_url)
+        broker_probe = rabbit
+        event_publisher = rabbit
+    else:
+        # Kafka — отдельный шаг; до подключения readiness честно говорит broker: fail.
+        broker_probe = UnconfiguredBrokerProbe()
+        event_publisher = NullEventPublisher()
     context = AppContext(
         settings=settings,
         engine=engine,
         session_factory=make_session_factory(engine),
         clock=AdjustableClock(),
-        # ---> точка расширения: реальная проверка брокера (вместе с издателем событий).
-        broker_probe=UnconfiguredBrokerProbe(),
+        broker_probe=broker_probe,
+        event_publisher=event_publisher,
         jobs=JobRegistry(),
     )
-    # ---> точка расширения: регистрация фоновых задач, например
-    # context.jobs.register("<job-name>", <корутина, возвращающая int>)
+
+    async def run_lesson_status_sweeper() -> int:
+        async with session_scope(context.session_factory) as session:
+            return await sweep_confirmed_lessons(session, context.clock)
+
+    context.jobs.register(LESSON_STATUS_SWEEPER, run_lesson_status_sweeper)
 
     async def reset_state() -> None:
         async with session_scope(context.session_factory) as session:
@@ -56,6 +77,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     context = build_context(settings)
     app.state.context = context
 
+    rabbit = (
+        context.event_publisher
+        if isinstance(context.event_publisher, RabbitMqEventBroker)
+        else None
+    )
+    if rabbit is not None:
+        await rabbit.connect()
+
     stop = asyncio.Event()
     periodic: asyncio.Task[None] | None = None
     if settings.test_mode:
@@ -71,6 +100,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop.set()
         if periodic is not None:
             await periodic
+        if rabbit is not None:
+            await rabbit.aclose()
         await context.engine.dispose()
 
 

@@ -1,7 +1,9 @@
-"""Операции с занятиями: create/validate (FR-01/02), список (FR-03), PATCH (FR-05).
+"""Операции с занятиями: create/validate (FR-01/02), список (FR-03), PATCH (FR-05),
+confirm/cancel/complete/reschedule (FR-06…FR-09), sweeper (FR-10).
 
-Create/validate/update: группа → local BR-01…03 → PeopleClient → existing → домен.
+Create/validate/update/reschedule: группа → local BR-01…03 → PeopleClient → existing → домен.
 Список: фильтры в SQL, сортировка и пагинация без stub.
+Lifecycle: смена статуса в сессии; конверт события — вызывающему для publish после commit.
 """
 
 from __future__ import annotations
@@ -12,10 +14,12 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.broker import build_envelope
 from app.clients.people import PeopleClient
-from app.clock import Clock
+from app.clock import Clock, to_iso_z
 from app.domain.rules import (
     ExistingLesson,
     HardFailure,
@@ -30,6 +34,8 @@ from app.models import Group, Lesson, LessonFormat, LessonStatus
 
 # Коды hard, которые validate отдаёт в violations (200), а не как HTTP-ошибку.
 _VALIDATE_AS_VIOLATION = frozenset({"CLASSROOM_TOO_SMALL", "SCHEDULE_CONFLICT"})
+
+LESSON_STATUS_SWEEPER = "lesson-status-sweeper"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +66,23 @@ class CreateResult:
 
     lesson: Lesson
     warnings: tuple[WarningItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionResult:
+    """Успешный переход статуса; ``event`` публикуется после commit (или None)."""
+
+    lesson: Lesson
+    event: dict[str, Any] | None
+
+
+@dataclass(frozen=True, slots=True)
+class RescheduleResult:
+    """Успешный перенос: новое занятие, soft-warnings и событие после commit."""
+
+    lesson: Lesson
+    warnings: tuple[WarningItem, ...]
+    event: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +229,259 @@ async def update_lesson(
     lesson.updated_at = clock.now()
     await session.flush()
     return CreateResult(lesson=lesson, warnings=outcome.warnings)
+
+
+async def confirm_lesson(
+    session: AsyncSession,
+    clock: Clock,
+    lesson_id: UUID,
+) -> TransitionResult:
+    """PLANNED → CONFIRMED (FR-06); конверт ``LessonConfirmed`` для publish после commit."""
+    lesson = await _get_lesson(session, lesson_id)
+    _assert_transition(lesson.status, {LessonStatus.PLANNED}, LessonStatus.CONFIRMED)
+
+    now = clock.now()
+    lesson.status = LessonStatus.CONFIRMED
+    lesson.updated_at = now
+    await session.flush()
+
+    event = build_envelope(
+        event_type="LessonConfirmed",
+        lesson_id=lesson.id,
+        occurred_at=now,
+        payload=_confirmed_payload(lesson),
+    )
+    return TransitionResult(lesson=lesson, event=event)
+
+
+async def cancel_lesson(
+    session: AsyncSession,
+    clock: Clock,
+    lesson_id: UUID,
+    reason: str | None = None,
+) -> TransitionResult:
+    """PLANNED|CONFIRMED → CANCELLED (FR-07); конверт ``LessonCancelled`` после commit."""
+    lesson = await _get_lesson(session, lesson_id)
+    allowed = {LessonStatus.PLANNED, LessonStatus.CONFIRMED}
+    _assert_transition(lesson.status, allowed, LessonStatus.CANCELLED)
+
+    previous_status = lesson.status
+    now = clock.now()
+    lesson.status = LessonStatus.CANCELLED
+    lesson.cancel_reason = reason
+    lesson.updated_at = now
+    await session.flush()
+
+    event = build_envelope(
+        event_type="LessonCancelled",
+        lesson_id=lesson.id,
+        occurred_at=now,
+        payload=_cancelled_payload(lesson, previous_status=previous_status, reason=reason),
+    )
+    return TransitionResult(lesson=lesson, event=event)
+
+
+async def complete_lesson(
+    session: AsyncSession,
+    clock: Clock,
+    lesson_id: UUID,
+) -> TransitionResult:
+    """IN_PROGRESS → COMPLETED (FR-09); переход раньше BR-08; события нет."""
+    lesson = await _get_lesson(session, lesson_id)
+    _assert_transition(lesson.status, {LessonStatus.IN_PROGRESS}, LessonStatus.COMPLETED)
+
+    now = clock.now()
+    if now < lesson.ends_at:
+        raise ApiError(
+            409,
+            "LESSON_NOT_FINISHED",
+            "Занятие ещё не закончилось",
+            {"ends_at": to_iso_z(lesson.ends_at), "now": to_iso_z(now)},
+        )
+
+    lesson.status = LessonStatus.COMPLETED
+    lesson.updated_at = now
+    await session.flush()
+    return TransitionResult(lesson=lesson, event=None)
+
+
+async def sweep_confirmed_lessons(session: AsyncSession, clock: Clock) -> int:
+    """CONFIRMED с ``starts_at ≤ now`` → IN_PROGRESS (FR-10). Возвращает число обновлённых."""
+    now = clock.now()
+    rows = (
+        await session.scalars(
+            select(Lesson).where(
+                Lesson.status == LessonStatus.CONFIRMED,
+                Lesson.starts_at <= now,
+            )
+        )
+    ).all()
+    for lesson in rows:
+        lesson.status = LessonStatus.IN_PROGRESS
+        lesson.updated_at = now
+    if rows:
+        await session.flush()
+    return len(rows)
+
+
+async def reschedule_lesson(
+    session: AsyncSession,
+    people: PeopleClient,
+    clock: Clock,
+    lesson_id: UUID,
+    fields: dict[str, Any],
+) -> RescheduleResult:
+    """Атомарный перенос (FR-08): исходное → RESCHEDULED, новое PLANNED + BR-01…BR-07.
+
+    ``fields`` — тело RescheduleRequest (exclude_unset): обязательны starts_at/ends_at;
+    instructor_id / classroom_id / format берутся из исходного, если не переданы.
+    """
+    source = await _get_lesson(session, lesson_id)
+    allowed = {LessonStatus.PLANNED, LessonStatus.CONFIRMED}
+    _assert_transition(source.status, allowed, LessonStatus.RESCHEDULED)
+
+    if await _has_reschedule_child(session, source.id):
+        raise ApiError(
+            409,
+            "TRANSITION_FORBIDDEN",
+            "Недопустимый переход",
+            {
+                "current_status": source.status.value,
+                "target_status": LessonStatus.RESCHEDULED.value,
+            },
+        )
+
+    data = LessonInput(
+        group_id=source.group_id,
+        instructor_id=fields.get("instructor_id", source.instructor_id),
+        classroom_id=fields.get("classroom_id", source.classroom_id),
+        format=fields.get("format", source.format),
+        starts_at=fields["starts_at"],
+        ends_at=fields["ends_at"],
+        exclude_lesson_id=source.id,
+    )
+    outcome = await _evaluate(session, people, data)
+    if outcome.hard is not None:
+        raise _hard_to_api_error(outcome.hard)
+
+    now = clock.now()
+    status_before = source.status.value
+    source.status = LessonStatus.RESCHEDULED
+    source.updated_at = now
+
+    new_lesson = Lesson(
+        id=uuid4(),
+        group_id=data.group_id,
+        instructor_id=data.instructor_id,
+        classroom_id=data.classroom_id,
+        format=data.format,
+        status=LessonStatus.PLANNED,
+        starts_at=data.starts_at,
+        ends_at=data.ends_at,
+        rescheduled_from_id=source.id,
+        cancel_reason=None,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(new_lesson)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        raise ApiError(
+            409,
+            "TRANSITION_FORBIDDEN",
+            "Недопустимый переход",
+            {
+                "current_status": status_before,
+                "target_status": LessonStatus.RESCHEDULED.value,
+            },
+        ) from exc
+
+    event = build_envelope(
+        event_type="LessonRescheduled",
+        lesson_id=source.id,
+        occurred_at=now,
+        payload=_rescheduled_payload(source, new_lesson),
+    )
+    return RescheduleResult(lesson=new_lesson, warnings=outcome.warnings, event=event)
+
+
+async def _get_lesson(session: AsyncSession, lesson_id: UUID) -> Lesson:
+    lesson = await session.get(Lesson, lesson_id)
+    if lesson is None:
+        raise ApiError(404, "NOT_FOUND", "Занятие не найдено", {})
+    return lesson
+
+
+def _assert_transition(
+    current: LessonStatus,
+    allowed: set[LessonStatus],
+    target: LessonStatus,
+) -> None:
+    if current not in allowed:
+        raise ApiError(
+            409,
+            "TRANSITION_FORBIDDEN",
+            "Недопустимый переход",
+            {"current_status": current.value, "target_status": target.value},
+        )
+
+
+def _confirmed_payload(lesson: Lesson) -> dict[str, Any]:
+    return {
+        "lesson_id": str(lesson.id),
+        "group_id": str(lesson.group_id),
+        "instructor_id": str(lesson.instructor_id),
+        "classroom_id": str(lesson.classroom_id) if lesson.classroom_id is not None else None,
+        "format": lesson.format.value,
+        "starts_at": to_iso_z(lesson.starts_at),
+        "ends_at": to_iso_z(lesson.ends_at),
+    }
+
+
+def _cancelled_payload(
+    lesson: Lesson,
+    *,
+    previous_status: LessonStatus,
+    reason: str | None,
+) -> dict[str, Any]:
+    return {
+        "lesson_id": str(lesson.id),
+        "group_id": str(lesson.group_id),
+        "instructor_id": str(lesson.instructor_id),
+        "starts_at": to_iso_z(lesson.starts_at),
+        "ends_at": to_iso_z(lesson.ends_at),
+        "previous_status": previous_status.value,
+        "reason": reason,
+    }
+
+
+def _interval_payload(lesson: Lesson) -> dict[str, Any]:
+    return {
+        "starts_at": to_iso_z(lesson.starts_at),
+        "ends_at": to_iso_z(lesson.ends_at),
+        "instructor_id": str(lesson.instructor_id),
+        "classroom_id": str(lesson.classroom_id) if lesson.classroom_id is not None else None,
+    }
+
+
+def _rescheduled_payload(source: Lesson, new_lesson: Lesson) -> dict[str, Any]:
+    return {
+        "lesson_id": str(source.id),
+        "rescheduled_to_id": str(new_lesson.id),
+        "group_id": str(source.group_id),
+        "instructor_id": str(source.instructor_id),
+        "previous": _interval_payload(source),
+        "new": _interval_payload(new_lesson),
+    }
+
+
+async def _has_reschedule_child(session: AsyncSession, lesson_id: UUID) -> bool:
+    """True, если у занятия уже есть перенос (rescheduled_from_id = lesson_id)."""
+    found = await session.scalar(
+        select(Lesson.id).where(Lesson.rescheduled_from_id == lesson_id).limit(1)
+    )
+    return found is not None
 
 
 async def _evaluate(
