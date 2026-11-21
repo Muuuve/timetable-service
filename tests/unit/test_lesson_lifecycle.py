@@ -1,18 +1,24 @@
-"""Юнит-тесты confirm / cancel / complete (FR-06/07/09) без реальной БД и брокера."""
+"""Юнит-тесты confirm / cancel / complete / reschedule (FR-06…FR-09) без БД и брокера."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
 
 from app.clock import AdjustableClock
+from app.domain.rules import HardFailure, RuleOutcome
 from app.errors import ApiError
 from app.models import LessonFormat, LessonStatus
-from app.services.lessons import cancel_lesson, complete_lesson, confirm_lesson
+from app.services.lessons import (
+    cancel_lesson,
+    complete_lesson,
+    confirm_lesson,
+    reschedule_lesson,
+)
 
 G1 = UUID("9a000000-0000-4000-8000-000000000001")
 I1 = UUID("1b000000-0000-4000-8000-000000000001")
@@ -182,3 +188,124 @@ async def test_complete_wrong_status_before_br08() -> None:
         "current_status": "PLANNED",
         "target_status": "COMPLETED",
     }
+
+
+@pytest.mark.asyncio
+async def test_reschedule_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _lesson(status=LessonStatus.PLANNED)
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=source)
+    session.scalar = AsyncMock(return_value=None)
+    session.add = MagicMock()
+    session.flush = AsyncMock()
+
+    async def fake_evaluate(*_args: object, **_kwargs: object) -> RuleOutcome:
+        return RuleOutcome()
+
+    monkeypatch.setattr("app.services.lessons._evaluate", fake_evaluate)
+
+    new_starts = datetime(2026, 12, 4, 5, 0, tzinfo=UTC)
+    new_ends = datetime(2026, 12, 4, 6, 30, tzinfo=UTC)
+    result = await reschedule_lesson(
+        session,
+        MagicMock(),
+        _clock(),
+        L1,
+        {"starts_at": new_starts, "ends_at": new_ends},
+    )
+
+    assert source.status is LessonStatus.RESCHEDULED
+    assert result.lesson.status is LessonStatus.PLANNED
+    assert result.lesson.group_id == G1
+    assert result.lesson.rescheduled_from_id == L1
+    assert result.lesson.starts_at == new_starts
+    assert result.lesson.instructor_id == I1
+    assert result.lesson.classroom_id == C1
+    assert result.event["event_type"] == "LessonRescheduled"
+    assert result.event["idempotency_key"] == f"lesson-rescheduled:{L1}"
+    assert result.event["payload"]["lesson_id"] == str(L1)
+    assert result.event["payload"]["rescheduled_to_id"] == str(result.lesson.id)
+    assert result.event["payload"]["previous"]["starts_at"] == "2026-12-01T05:00:00Z"
+    assert result.event["payload"]["new"]["starts_at"] == "2026-12-04T05:00:00Z"
+    session.add.assert_called_once()
+    session.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reschedule_wrong_status() -> None:
+    source = _lesson(status=LessonStatus.IN_PROGRESS)
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=source)
+
+    with pytest.raises(ApiError) as exc_info:
+        await reschedule_lesson(
+            session,
+            MagicMock(),
+            _clock(),
+            L1,
+            {
+                "starts_at": datetime(2026, 12, 4, 5, 0, tzinfo=UTC),
+                "ends_at": datetime(2026, 12, 4, 6, 30, tzinfo=UTC),
+            },
+        )
+
+    assert exc_info.value.code == "TRANSITION_FORBIDDEN"
+    assert exc_info.value.details == {
+        "current_status": "IN_PROGRESS",
+        "target_status": "RESCHEDULED",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reschedule_already_has_child() -> None:
+    source = _lesson(status=LessonStatus.CONFIRMED)
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=source)
+    session.scalar = AsyncMock(return_value=UUID("0f6c2b1e-3d4a-4b5c-9d6e-7f8a9b0c1d2e"))
+
+    with pytest.raises(ApiError) as exc_info:
+        await reschedule_lesson(
+            session,
+            MagicMock(),
+            _clock(),
+            L1,
+            {
+                "starts_at": datetime(2026, 12, 4, 5, 0, tzinfo=UTC),
+                "ends_at": datetime(2026, 12, 4, 6, 30, tzinfo=UTC),
+            },
+        )
+
+    assert exc_info.value.code == "TRANSITION_FORBIDDEN"
+    assert source.status is LessonStatus.CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_reschedule_hard_skips_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _lesson(status=LessonStatus.PLANNED)
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=source)
+    session.scalar = AsyncMock(return_value=None)
+    session.flush = AsyncMock()
+
+    async def fake_evaluate(*_args: object, **_kwargs: object) -> RuleOutcome:
+        return RuleOutcome(
+            hard=HardFailure(409, "SCHEDULE_CONFLICT", "Конфликт", {"conflicts": []})
+        )
+
+    monkeypatch.setattr("app.services.lessons._evaluate", fake_evaluate)
+
+    with pytest.raises(ApiError) as exc_info:
+        await reschedule_lesson(
+            session,
+            MagicMock(),
+            _clock(),
+            L1,
+            {
+                "starts_at": datetime(2026, 12, 4, 5, 0, tzinfo=UTC),
+                "ends_at": datetime(2026, 12, 4, 6, 30, tzinfo=UTC),
+            },
+        )
+
+    assert exc_info.value.code == "SCHEDULE_CONFLICT"
+    assert source.status is LessonStatus.PLANNED
+    session.flush.assert_not_awaited()

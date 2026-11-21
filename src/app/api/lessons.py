@@ -1,5 +1,5 @@
 """HTTP-слой занятий: create/validate/list/get/patch (FR-01…FR-05),
-confirm/cancel/complete (FR-06/07/09).
+confirm/cancel/complete/reschedule (FR-06…FR-09).
 """
 
 from datetime import datetime
@@ -31,6 +31,7 @@ from app.services.lessons import (
     confirm_lesson,
     create_lesson,
     list_lessons,
+    reschedule_lesson,
     update_lesson,
     validate_lesson,
 )
@@ -76,6 +77,18 @@ class CancelBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: Annotated[str | None, Field(default=None, max_length=500)] = None
+
+
+class RescheduleBody(BaseModel):
+    """Тело ``POST /lessons/{id}/reschedule`` (openapi ``RescheduleRequest``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    instructor_id: UUID | None = None
+    classroom_id: UUID | None = None
+    format: LessonFormat | None = None
 
 
 class LessonResponse(BaseModel):
@@ -275,3 +288,21 @@ async def post_complete_lesson(lesson_id: UUID, request: Request) -> LessonRespo
     async with session_scope(context.session_factory) as session:
         result = await complete_lesson(session, context.clock, lesson_id)
     return LessonResponse.model_validate(result.lesson)
+
+
+@router.post("/{lesson_id}/reschedule", status_code=201, response_model=LessonWithWarningsResponse)
+async def post_reschedule_lesson(
+    lesson_id: UUID, body: RescheduleBody, request: Request
+) -> LessonWithWarningsResponse:
+    """Перенести занятие: исходное → RESCHEDULED, новое PLANNED (FR-08)."""
+    context = get_context(request)
+    fields = body.model_dump(exclude_unset=True)
+    async with httpx.AsyncClient(base_url=context.settings.stub_base_url) as http:
+        people = PeopleClient(http, context.settings.stub_timeout_ms)
+        async with session_scope(context.session_factory) as session:
+            result = await reschedule_lesson(session, people, context.clock, lesson_id, fields)
+    await context.event_publisher.publish(result.event)
+    return LessonWithWarningsResponse(
+        lesson=LessonResponse.model_validate(result.lesson),
+        warnings=[_to_warning(item) for item in result.warnings],
+    )
